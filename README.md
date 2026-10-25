@@ -33,17 +33,43 @@ Check https://opentelemetry.io/docs/languages/go/getting-started/ for more infor
 package main
 
 import (
+	"context"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/disgoorg/disgo"
+	"github.com/disgoorg/disgo/bot"
 	"github.com/disgoorg/disgo/handler"
+	"github.com/disgoorg/disgo/rest"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+
 	"github.com/disgoorg/oteldisgo"
 )
 
 func main() {
 	r := handler.New()
-	r.Use(oteldisgo.Middleware("example"))
+	r.Use(oteldisgo.Middleware())
 	// handle commands as usual here
-}
 
+	client, err := disgo.New(os.Getenv("DISCORD_TOKEN"),
+		bot.WithDefaultGateway(),
+		bot.WithRestClientConfigOpts(
+			rest.WithHTTPClient(&http.Client{
+				Transport: otelhttp.NewTransport(oteldisgo.NewTransport(nil)),
+				Timeout:   5 * time.Second,
+			}),
+		),
+		bot.WithEventListeners(r),
+	)
+	if err != nil {
+		panic(err)
+	}
+	defer client.Close(context.TODO())
+}
 ```
+
+`oteldisgo.NewTransport` redacts Discord interaction and webhook tokens from the `url.full` span attribute while leaving the outbound request URL intact.
 
 ### OTEL Tracing
 

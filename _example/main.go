@@ -45,21 +45,28 @@ var (
 func main() {
 	slog.SetLogLoggerLevel(slog.LevelDebug)
 
-	tracer, err := newTracer()
+	tracer, shutdown, err := setupOTel()
 	if err != nil {
-		slog.Error("error while getting tracer", slog.Any("err", err))
+		slog.Error("error while setting up opentelemetry", slog.Any("err", err))
 		return
 	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := shutdown(ctx); err != nil {
+			slog.Error("error while shutting down opentelemetry", slog.Any("err", err))
+		}
+	}()
 
 	r := handler.New()
-	r.Use(oteldisgo.Middleware("example"))
+	r.Use(oteldisgo.Middleware())
 	r.Command("/ping", pingHandler(tracer))
 
 	client, err := disgo.New(token,
 		bot.WithDefaultGateway(),
 		bot.WithRestClientConfigOpts(
 			rest.WithHTTPClient(&http.Client{
-				Transport: otelhttp.NewTransport(nil),
+				Transport: otelhttp.NewTransport(oteldisgo.NewTransport(nil)),
 				Timeout:   5 * time.Second,
 			}),
 		),

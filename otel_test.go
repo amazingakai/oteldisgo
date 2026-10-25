@@ -4,6 +4,7 @@ import (
 	"context"
 	"embed"
 	"errors"
+	"net/http"
 	"path"
 	"testing"
 
@@ -17,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	semconv "go.opentelemetry.io/otel/semconv/v1.43.0"
 	oteltrace "go.opentelemetry.io/otel/trace"
 )
 
@@ -242,7 +244,7 @@ func TestInteractionSpans(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			exporter, tp := setupTestTracer(t)
 			r := handler.New()
-			r.Use(Middleware("test-bot", WithTracerProvider(tp)))
+			r.Use(Middleware(WithTracerProvider(tp)))
 			tc.register(r)
 
 			ie := loadInteractionEvent(t, tc.file)
@@ -264,6 +266,9 @@ func TestInteractionSpans(t *testing.T) {
 			}
 			if span.Status.Code != codes.Unset {
 				t.Errorf("expected status Unset, got %v", span.Status.Code)
+			}
+			if span.InstrumentationScope.Name != Module {
+				t.Errorf("InstrumentationScope.Name = %q, want %q", span.InstrumentationScope.Name, Module)
 			}
 
 			attrs := attrMap(span.Attributes)
@@ -293,7 +298,7 @@ func TestFilterSkipsSpanAndMetricsWhenFalse(t *testing.T) {
 	exporter, tp := setupTestTracer(t)
 	reader, mp := setupTestMeter(t)
 
-	mw := Middleware("test-bot",
+	mw := Middleware(
 		WithTracerProvider(tp),
 		WithMeterProvider(mp),
 		WithFilter(func(e *handler.InteractionEvent) bool {
@@ -330,7 +335,7 @@ func TestFilterSkipsSpanAndMetricsWhenFalse(t *testing.T) {
 func TestHandlerErrorRecordedOnSpan(t *testing.T) {
 	exporter, tp := setupTestTracer(t)
 
-	mw := Middleware("test-bot", WithTracerProvider(tp))
+	mw := Middleware(WithTracerProvider(tp))
 	expectedErr := errors.New("interaction failed: database timeout")
 
 	wrapped := mw(func(e *handler.InteractionEvent) error {
@@ -364,7 +369,7 @@ func TestWithSpanNameFormatter(t *testing.T) {
 	exporter, tp := setupTestTracer(t)
 
 	r := handler.New()
-	r.Use(Middleware("test-bot",
+	r.Use(Middleware(
 		WithTracerProvider(tp),
 		WithSpanNameFormatter(func(e *handler.InteractionEvent) string {
 			return "custom:" + e.Vars["choice"]
@@ -394,7 +399,7 @@ func TestMetricsRecordingAndCardinality(t *testing.T) {
 	reader, mp := setupTestMeter(t)
 
 	r := handler.New()
-	r.Use(Middleware("test-bot", WithTracerProvider(tp), WithMeterProvider(mp)))
+	r.Use(Middleware(WithTracerProvider(tp), WithMeterProvider(mp)))
 
 	var activeDuringHandler int64
 	r.ButtonComponent("/rps/play/{choice}/{game_id}", func(data discord.ButtonInteractionData, e *handler.ComponentEvent) error {
@@ -436,6 +441,9 @@ func TestMetricsRecordingAndCardinality(t *testing.T) {
 	}
 	if len(rm.ScopeMetrics) != 1 {
 		t.Fatalf("expected 1 ScopeMetrics, got %d", len(rm.ScopeMetrics))
+	}
+	if rm.ScopeMetrics[0].Scope.Name != Module {
+		t.Errorf("ScopeMetrics.Scope.Name = %q, want %q", rm.ScopeMetrics[0].Scope.Name, Module)
 	}
 
 	metricsByName := make(map[string]metricdata.Metrics)
@@ -510,7 +518,7 @@ func TestConfigNilFallbackAndUnknownInteraction(t *testing.T) {
 		t.Fatalf("expected non-nil providers and formatter when nil passed to config options")
 	}
 
-	mw := Middleware("test-bot", WithTracerProvider(tp))
+	mw := Middleware(WithTracerProvider(tp))
 	wrapped := mw(func(e *handler.InteractionEvent) error {
 		return nil
 	})
@@ -556,6 +564,109 @@ func TestNormalizePathEdgeCases(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := normalizePath(tc.path, tc.vars); got != tc.want {
 				t.Errorf("normalizePath(%q, %v) = %q, want %q", tc.path, tc.vars, got, tc.want)
+			}
+		})
+	}
+}
+
+type roundTripperFunc func(r *http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+type closeIdleRoundTripper struct {
+	http.RoundTripper
+	closed bool
+}
+
+func (c *closeIdleRoundTripper) CloseIdleConnections() {
+	c.closed = true
+}
+
+func TestNewTransportRedactsTokens(t *testing.T) {
+	// Verify nil base defaults to http.DefaultTransport without panicking
+	if tr := NewTransport(nil); tr == nil {
+		t.Fatalf("expected non-nil RoundTripper when base is nil")
+	}
+
+	// Verify CloseIdleConnections forwards to base transport
+	baseIdle := &closeIdleRoundTripper{RoundTripper: http.DefaultTransport}
+	trIdle := NewTransport(baseIdle)
+	trIdle.(interface{ CloseIdleConnections() }).CloseIdleConnections()
+	if !baseIdle.closed {
+		t.Errorf("expected CloseIdleConnections to be forwarded to base RoundTripper")
+	}
+
+	tests := []struct {
+		name        string
+		rawURL      string
+		wantURLFull string
+	}{
+		{
+			name:        "interaction callback token redacted",
+			rawURL:      "https://discord.com/api/v10/interactions/123456789/secret-interaction-token/callback",
+			wantURLFull: "https://discord.com/api/v10/interactions/123456789/REDACTED/callback",
+		},
+		{
+			name:        "interaction original response token redacted",
+			rawURL:      "https://discord.com/api/v10/webhooks/200000002/secret-interaction-token/messages/@original",
+			wantURLFull: "https://discord.com/api/v10/webhooks/200000002/REDACTED/messages/@original",
+		},
+		{
+			name:        "webhook execute token with query redacted",
+			rawURL:      "https://discord.com/api/v10/webhooks/200000002/secret-webhook-token?wait=true",
+			wantURLFull: "https://discord.com/api/v10/webhooks/200000002/REDACTED?wait=true",
+		},
+		{
+			name:        "webhook without token untouched",
+			rawURL:      "https://discord.com/api/v10/webhooks/200000002",
+			wantURLFull: "https://discord.com/api/v10/webhooks/200000002",
+		},
+		{
+			name:        "regular channel messages endpoint untouched",
+			rawURL:      "https://discord.com/api/v10/channels/400000004/messages",
+			wantURLFull: "https://discord.com/api/v10/channels/400000004/messages",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			exporter, tp := setupTestTracer(t)
+			tracer := tp.Tracer("test")
+
+			var receivedURL string
+			rt := NewTransport(roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+				receivedURL = r.URL.String()
+				return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+			}))
+
+			ctx, span := tracer.Start(context.Background(), "HTTP POST",
+				oteltrace.WithAttributes(semconv.URLFull(tc.rawURL)),
+			)
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, tc.rawURL, nil)
+			if err != nil {
+				t.Fatalf("failed to create request: %v", err)
+			}
+
+			resp, err := rt.RoundTrip(req)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			_ = resp.Body.Close()
+			span.End()
+
+			if receivedURL != tc.rawURL {
+				t.Errorf("underlying RoundTripper received URL %q, want unredacted %q", receivedURL, tc.rawURL)
+			}
+
+			spans := exporter.GetSpans()
+			if len(spans) != 1 {
+				t.Fatalf("expected 1 span, got %d", len(spans))
+			}
+			gotURLFull := attrMap(spans[0].Attributes)[string(semconv.URLFullKey)].AsString()
+			if gotURLFull != tc.wantURLFull {
+				t.Errorf("span url.full = %q, want %q", gotURLFull, tc.wantURLFull)
 			}
 		})
 	}
